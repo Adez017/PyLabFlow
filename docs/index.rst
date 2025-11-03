@@ -1,4 +1,4 @@
-lwFlow documentation
+PyLabFlow documentation
 ============================
 
 .. toctree::
