@@ -304,19 +304,23 @@ def _import_on_remote(zip_path, meta, mode="copy"):
         else:
             shutil.copy2(item, target)
 
+            
+    # ---- Register pipelines ----
+    _register_ppls_in_db(meta.get("ppls", {}))
+
     # ---- Attach transfer context (provenance only) ----
     ctx = TransferContext(
         path_map=meta.get("path_map", {}),
         component_map=meta.get("component_map", {}),
         transfer_id=meta["transfer_id"],
-        origin_lab_id=meta.get("origin_lab_id"),
+        # origin_lab_id=meta.get("origin_lab_id"),
     )
 
     settings["transfer_context"] = ctx
     set_shared_data(settings)
 
     return True
-
+  
 # ---------------------------
 # Internal: import on base
 # ---------------------------
@@ -325,6 +329,35 @@ def _import_on_base(zip_path, meta):
     results_dir = Path(settings["data_path"]) / "RemoteResults" / meta["transfer_id"]
     _safe_extract(zip_path, results_dir)
 
+
+def _register_ppls_in_db(ppls_meta: dict):
+    settings = get_shared_data()
+    db_path = Path(settings["data_path"]) / "ppls.db"
+
+    db = Db(db_path=str(db_path))
+
+    existing = {
+        row[0]
+        for row in db.query("SELECT pplid FROM ppls").fetchall()
+    }
+
+    for pplid, info in ppls_meta.items():
+        if pplid in existing:
+            continue  # idempotent import
+
+        db.execute(
+            """
+            INSERT INTO ppls (pplid, args_hash, status)
+            VALUES (?, ?, ?)
+            """,
+            (
+                pplid,
+                info.get("config_hash", ""),
+                "init",
+            ),
+        )
+
+    db.close()
 
 
 import json
