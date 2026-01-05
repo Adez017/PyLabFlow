@@ -15,7 +15,8 @@ from .utils import (
     get_invalid_loc_queries,
     Db,
     Component)
-from ._transfer_utils import TransferContext, _load_transfer_config
+
+from ._transfer_utils import TransferContext
 from .context import get_shared_data
 
 class CompsDict(TypedDict):
@@ -41,10 +42,13 @@ class PipeLine:
         Initialize the pipeline with default settings and empty components.
         """
         self._paths = ['config']
+        self.settings = get_shared_data()
+
+        self__lab_type = self.settings.get("lab_role")
 
         self.pplid = None
         self.workflow = None
-        self.settings = get_shared_data()
+        
         self.cnfg = None
         self._prepared = False
         self.__db = Db(db_path=f"{self.settings['data_path']}/ppls.db")
@@ -295,6 +299,9 @@ class PipeLine:
         - Appends experiment metadata to the main experiments CSV.
         - Optionally calls `self.prepare()` if `prepare=True`.
         """
+        if self.settings.get("lab_role") != "base":
+            print("cant use new in remote lab")
+            return
         if self.verify(pplid=pplid):
             raise ValueError(f"{pplid} is already exists  try  different id")
         self._check_args(args)
@@ -346,8 +353,24 @@ class PipeLine:
         - Sets internal flag `_prepared` to True on success.
         """
         try:
+
+
+            if self.settings.get("lab_role") != "base":
+
+
+
+
+
+
+
+
+
+                pass
             self.workflow = self.load_component(**self.cnfg['workflow'])
             self._prepared = self.workflow.prepare()
+
+
+
         except:
             traceback.print_exc()
    

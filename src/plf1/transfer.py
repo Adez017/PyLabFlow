@@ -11,6 +11,7 @@ from copy import deepcopy
 from .utils import Db
 from .context import get_shared_data, set_shared_data
 from ._pipeline import PipeLine
+from ._transfer_utils import TransferContext
 
 # ---------------------------
 # Role enforcement
@@ -35,13 +36,17 @@ def _load_transfer_config(transfers_dir: Path):
         return {
             "active_transfer_id": None,
             "history": [],
-            "ppl_to_transfer": {}
+            "ppl_to_transfer": {} #sqlit3
         }
     return json.loads(cfg_path.read_text(encoding="utf-8"))
 #---------------------
 # Safe ZIP extraction
 # ---------------------------
 def _safe_extract(zip_path: Path, target_dir: Path):
+    # extract  srcs  and locs
+    #  then configs
+    # then other artifacts
+
     target_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
         for member in zf.infolist():
@@ -139,7 +144,7 @@ def collect_transfer_meta(ppls):
 
 def _payload_name(src: str) -> str:
     h = hashlib.sha1(src.encode()).hexdigest()[:8]
-    return f"p_{h}"
+    return f"p_{h}"   ##  extention cdonsistency
 
 
 def _write_payload(zf, lab_base: Path, paths: set):
@@ -167,10 +172,102 @@ def _write_payload(zf, lab_base: Path, paths: set):
 
     return path_map
 
+import ast
+import hashlib
+from pathlib import Path
+from copy import deepcopy
+
+def _write_loc_payload(zf, locs: set, transfer_id: str):
+    settings = get_shared_data()
+    component_dir = Path(settings["component_dir"]).resolve()
+
+    loc_map = {}
+    code_chunks = []
+
+    # Step 1: collect all classes across LOCs
+    class_defs = {}  # loc -> (class_name, ast.ClassDef)
+    for loc in sorted(locs):
+        if "." not in loc:
+            continue
+
+        module_path_str, class_name = loc.rsplit(".", 1)
+        module_path = (component_dir / Path(*module_path_str.split("."))).with_suffix(".py")
+
+        if not module_path.exists():
+            print(f"Warning: component file not found: {module_path}")
+            continue
+
+        code_text = module_path.read_text(encoding="utf-8")
+        tree = ast.parse(code_text)
+
+        target_class = None
+        imports = []
+
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                imports.append(node)
+            elif isinstance(node, ast.ClassDef) and node.name == class_name:
+                target_class = node
+
+        if target_class is None:
+            print(f"Warning: class '{class_name}' not found in {module_path}")
+            continue
+
+        class_defs[loc] = (class_name, deepcopy(target_class), imports)
+
+    if not class_defs: # if  there are no loc in  configs
+        raise RuntimeError("No classes found for the provided locs")
+
+    # Step 2: compute unique names for all classes
+    old_to_new = {}
+    for loc, (class_name, class_node, _) in class_defs.items():
+        loc_hash = hashlib.sha1(loc.encode("utf-8")).hexdigest()[:8]
+        new_name = f"{class_name}{loc_hash}"
+        old_to_new[class_name] = new_name
+        loc_map[loc] = f"{transfer_id}.{new_name}" # keep hash of trasfer_id  will  be shorter
+
+    # Step 3: rewrite ASTs with renamed classes and updated bases
+    final_code_chunks = []
+    all_imports = set()
+
+    for loc, (class_name, class_node, imports) in class_defs.items():
+        # Rename class
+        class_node.name = old_to_new[class_name]
+
+        # Replace base classes if they exist in old_to_new
+        new_bases = []
+        for base in class_node.bases:
+            if isinstance(base, ast.Name) and base.id in old_to_new:
+                new_bases.append(ast.Name(id=old_to_new[base.id], ctx=ast.Load()))
+            else:
+                new_bases.append(base)
+        class_node.bases = new_bases
+
+        # Collect imports
+        for imp in imports:
+            all_imports.add(ast.unparse(imp))   #   avoid dublicates
+
+        # Build final module chunk for this class
+        module_chunk = ast.Module(body=[class_node], type_ignores=[])
+        ast.fix_missing_locations(module_chunk)
+        class_code = ast.unparse(module_chunk)
+
+        final_code_chunks.append(f"# --- {loc} ---\n{class_code}\n")
+
+    # Combine imports + class chunks
+    imports_code = "\n".join(sorted(all_imports))
+    py_code = f"{imports_code}\n\n" + "\n\n".join(final_code_chunks)
+
+    # Write single .py file to zip
+    py_name = f"{transfer_id}.py" # take hash of transferid
+    zf.writestr(py_name, py_code)
+
+    return loc_map
+
 # ---------------------------
 # Internal: BASE -> REMOTE
 # ---------------------------
-def _export_base_to_remote(ppls, clone_id, transfer_type, mode="copy"):
+def _export_base_to_remote(ppls, clone_id, transfer_type):
     settings = get_shared_data()
     _ensure_base(settings)
 
@@ -178,7 +275,7 @@ def _export_base_to_remote(ppls, clone_id, transfer_type, mode="copy"):
     clone_dir = lab_base / "Clones" / clone_id
     if not clone_dir.exists():
         raise ValueError(f"Clone '{clone_id}' not registered")
-
+    # datetime.now(datetime.timetz().)
     transfer_id = f"t_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
     zip_path = clone_dir / "transfers" / f"{transfer_id}.zip"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,8 +314,8 @@ def _export_base_to_remote(ppls, clone_id, transfer_type, mode="copy"):
 
             # ---- ARTIFACTS (file or dir) ----
             for art in P.paths:
-                if art == "config":
-                    continue
+                # if art == "config":
+                #     continue
 
                 try:
                     p = Path(P.get_path(of=art)).resolve()
@@ -246,22 +343,8 @@ def _export_base_to_remote(ppls, clone_id, transfer_type, mode="copy"):
     # ---- REGISTER TRANSFER ----
     clone_json = clone_dir / "clone.json"
     clone_cfg = json.loads(clone_json.read_text())
-    clone_cfg.setdefault("transfers", []).append(transfer_id)
+    clone_cfg.setdefault("transfers", []).append(transfer_id) # keep  ppls  too
     clone_json.write_text(json.dumps(clone_cfg, indent=4))
-
-    # ---- MOVE MODE ----
-    if mode == "move":
-        for pplid in ppls:
-            P = PipeLine(pplid)
-            for art in P.paths:
-                if art == "config":
-                    continue
-                p = Path(P.get_path(of=art))
-                if p.exists():
-                    if p.is_dir():
-                        shutil.rmtree(p)
-                    else:
-                        p.unlink()
 
     return zip_path
 # ---------------------------
@@ -458,7 +541,7 @@ def _import_on_remote(zip_path: Path, meta: dict, mode="copy", allow_overwrite=F
         "origin_lab_id": meta.get("origin_lab_id"),
         "created_at": meta.get("created_at"),
         "ppls": sorted(incoming_ppls),
-        "path_map": tm.get("path_map", {}),
+        "path_map": tm.get("path_map", {}), #  use from transfer dir with map
         "loc_map": tm.get("loc_map", {})
     }
 
@@ -487,97 +570,6 @@ def _import_on_remote(zip_path: Path, meta: dict, mode="copy", allow_overwrite=F
 def _loc_hash(code: str) -> str:
     return hashlib.sha1(code.encode()).hexdigest()[:8]
 
-import ast
-import hashlib
-from pathlib import Path
-from copy import deepcopy
-
-def _write_loc_payload(zf, locs: set, transfer_id: str):
-    settings = get_shared_data()
-    component_dir = Path(settings["component_dir"]).resolve()
-
-    loc_map = {}
-    code_chunks = []
-
-    # Step 1: collect all classes across LOCs
-    class_defs = {}  # loc -> (class_name, ast.ClassDef)
-    for loc in sorted(locs):
-        if "." not in loc:
-            continue
-
-        module_path_str, class_name = loc.rsplit(".", 1)
-        module_path = (component_dir / Path(*module_path_str.split("."))).with_suffix(".py")
-
-        if not module_path.exists():
-            print(f"Warning: component file not found: {module_path}")
-            continue
-
-        code_text = module_path.read_text(encoding="utf-8")
-        tree = ast.parse(code_text)
-
-        target_class = None
-        imports = []
-
-        for node in tree.body:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                imports.append(node)
-            elif isinstance(node, ast.ClassDef) and node.name == class_name:
-                target_class = node
-
-        if target_class is None:
-            print(f"Warning: class '{class_name}' not found in {module_path}")
-            continue
-
-        class_defs[loc] = (class_name, deepcopy(target_class), imports)
-
-    if not class_defs:
-        raise RuntimeError("No classes found for the provided LOCs")
-
-    # Step 2: compute unique names for all classes
-    old_to_new = {}
-    for loc, (class_name, class_node, _) in class_defs.items():
-        loc_hash = hashlib.sha1(loc.encode("utf-8")).hexdigest()[:8]
-        new_name = f"{class_name}{loc_hash}"
-        old_to_new[class_name] = new_name
-        loc_map[loc] = f"{transfer_id}.{new_name}"
-
-    # Step 3: rewrite ASTs with renamed classes and updated bases
-    final_code_chunks = []
-    all_imports = set()
-
-    for loc, (class_name, class_node, imports) in class_defs.items():
-        # Rename class
-        class_node.name = old_to_new[class_name]
-
-        # Replace base classes if they exist in old_to_new
-        new_bases = []
-        for base in class_node.bases:
-            if isinstance(base, ast.Name) and base.id in old_to_new:
-                new_bases.append(ast.Name(id=old_to_new[base.id], ctx=ast.Load()))
-            else:
-                new_bases.append(base)
-        class_node.bases = new_bases
-
-        # Collect imports
-        for imp in imports:
-            all_imports.add(ast.unparse(imp))
-
-        # Build final module chunk for this class
-        module_chunk = ast.Module(body=[class_node], type_ignores=[])
-        ast.fix_missing_locations(module_chunk)
-        class_code = ast.unparse(module_chunk)
-
-        final_code_chunks.append(f"# --- {loc} ---\n{class_code}\n")
-
-    # Combine imports + class chunks
-    imports_code = "\n".join(sorted(all_imports))
-    py_code = f"{imports_code}\n\n" + "\n\n".join(final_code_chunks)
-
-    # Write single .py file to zip
-    py_name = f"{transfer_id}.py"
-    zf.writestr(py_name, py_code)
-
-    return loc_map
 
 # ---------------------------
 # Internal: import on base
