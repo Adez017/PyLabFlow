@@ -22,7 +22,7 @@ def _load_transfer_config():
             "ppl_to_transfer": {} #sqlit3
         }
     return json.loads(cfg_path.read_text(encoding="utf-8"))
-# ------
+# ---------------------------
 
 
 # ---------------------------
