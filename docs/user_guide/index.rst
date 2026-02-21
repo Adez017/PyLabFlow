@@ -7,4 +7,5 @@ User Guide
 
    concepts
    workflow
+   testing
 
