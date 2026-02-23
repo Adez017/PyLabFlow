@@ -2,11 +2,13 @@
 This module  have all  function  for initiating pipeline and training
 """
 
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 import json
 import os
 import shutil
 from collections import defaultdict
+from datetime import datetime
+import hashlib
 import pandas as pd
 
 from .context import get_shared_data
@@ -424,6 +426,183 @@ def delete_ppl(ppls: List[str]) -> None:
 
     db.close()
 
+
+def _safe_read_json(path: str) -> Optional[Dict]:
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _collect_source_records(source: str) -> Dict[str, Dict[str, Optional[str]]]:
+    records: Dict[str, Dict[str, Optional[str]]] = {}
+
+    db_path = os.path.join(source, "ppls.db")
+    if os.path.exists(db_path):
+        db = Db(db_path=db_path)
+        try:
+            for pplid, args_hash in db.query("SELECT pplid, args_hash FROM ppls"):
+                records[pplid] = {"args_hash": args_hash}
+        except Exception:
+            pass
+        finally:
+            db.close()
+
+    csv_path = os.path.join(source, "ppls.csv")
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        key = "name" if "name" in df.columns else "pplid"
+        for _, row in df.iterrows():
+            pplid = row.get(key)
+            if isinstance(pplid, str) and pplid:
+                records.setdefault(pplid, {"args_hash": row.get("args_hash")})
+
+    return records
+
+
+def _collect_edge_links(source: str) -> Dict[str, Set[str]]:
+    links: Dict[str, Set[str]] = defaultdict(set)
+    db_path = os.path.join(source, "ppls.db")
+    if not os.path.exists(db_path):
+        return links
+
+    db = Db(db_path=db_path)
+    try:
+        rows = db.query("SELECT prev, next FROM edges")
+    except Exception:
+        rows = []
+    finally:
+        db.close()
+
+    for prev, nxt in rows:
+        links[prev].add(nxt)
+        links[nxt].add(prev)
+    return links
+
+
+def _extract_linked_pplids_from_config(cfg: Dict, known_pplids: Set[str]) -> Set[str]:
+    linked: Set[str] = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                lowered = key.lower()
+                if isinstance(value, str):
+                    if value in known_pplids and (
+                        "pplid" in lowered
+                        or "pipeline" in lowered
+                        or "parent" in lowered
+                        or "source" in lowered
+                        or "ref" in lowered
+                        or "base" in lowered
+                    ):
+                        linked.add(value)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(cfg)
+    return linked
+
+
+def _resolve_transfer_set(requested_ppls: List[str], source: str) -> List[str]:
+    records = _collect_source_records(source)
+    known = set(records.keys())
+
+    missing = [p for p in requested_ppls if p not in known]
+    if missing:
+        raise ValueError(f"One or more of ppls: {missing} is/are invalid")
+
+    links = _collect_edge_links(source)
+
+    resolved: List[str] = []
+    seen: Set[str] = set()
+    queue = list(requested_ppls)
+
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        resolved.append(current)
+
+        for linked in sorted(links.get(current, set())):
+            if linked in known and linked not in seen:
+                queue.append(linked)
+
+        cfg_path = os.path.join(source, "Configs", f"{current}.json")
+        cfg = _safe_read_json(cfg_path)
+        if cfg:
+            for linked in sorted(_extract_linked_pplids_from_config(cfg, known)):
+                if linked != current and linked not in seen:
+                    queue.append(linked)
+
+    return resolved
+
+
+def _pipeline_artifact_specs(pplid: str) -> List[Dict[str, str]]:
+    return [
+        {
+            "src": os.path.join("Configs", f"{pplid}.json"),
+            "dst": os.path.join("Configs", f"{pplid}.json"),
+            "kind": "file",
+        },
+        {
+            "src": os.path.join("Histories", f"{pplid}.csv"),
+            "dst": os.path.join("Histories", f"{pplid}.csv"),
+            "kind": "file",
+        },
+        {
+            "src": os.path.join("Weights", pplid),
+            "dst": os.path.join("Weights", pplid),
+            "kind": "dir",
+        },
+        {
+            "src": os.path.join("Gradients", pplid),
+            "dst": os.path.join("Gradients", pplid),
+            "kind": "dir",
+        },
+    ]
+
+
+def _write_transfer_manifest(
+    destination: str,
+    transfer_type: str,
+    mode: str,
+    requested: List[str],
+    transferred: List[str],
+    source_records: Dict[str, Dict[str, Optional[str]]],
+) -> None:
+    manifest_records = {}
+    for pplid in transferred:
+        cfg_path = os.path.join(destination, "Configs", f"{pplid}.json")
+        cfg_sha256 = None
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "rb") as f:
+                cfg_sha256 = hashlib.sha256(f.read()).hexdigest()
+
+        manifest_records[pplid] = {
+            "args_hash": source_records.get(pplid, {}).get("args_hash"),
+            "config_sha256": cfg_sha256,
+        }
+
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    manifest = {
+        "created_at_utc": stamp,
+        "transfer_type": transfer_type,
+        "mode": mode,
+        "requested_ppls": requested,
+        "transferred_ppls": transferred,
+        "auto_included_dependencies": [p for p in transferred if p not in requested],
+        "records": manifest_records,
+    }
+
+    manifest_path = os.path.join(destination, f"transfer_manifest_{stamp}.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
 def transfer_ppl(
     ppls: List[str], transfer_type: str = "export", mode: str = "copy", env=True
 ) -> None:
@@ -456,63 +635,109 @@ def transfer_ppl(
         ppls = [ppls]
 
     base_path = settings["data_path"]
+    transfer_folder = os.path.join(base_path, "Transfer")
 
     if transfer_type == "export":
         source = base_path
-        destin = f"{base_path}/Transfer"
+        destin = transfer_folder
     elif transfer_type == "import":
-        source = f"{base_path}/Transfer"
+        source = transfer_folder
         destin = base_path
     else:
         raise ValueError(
             f"Invalid transfer_type: {transfer_type}. Expected 'export' or 'import'."
         )
 
-    df = pd.read_csv(f"{source}/ppls.csv")
-    records = df["name"] if "name" in df.columns else df["pplid"]
-
-    if not all(exp in records.values for exp in ppls):
-        raise ValueError(f"One or more of ppls: {ppls} is/are invalid")
-
-    if mode == "copy":
-        for exp in ppls:
-            shutil.copy2(f"{source}/Configs/{exp}.json", f"{destin}/Configs/{exp}.json")
-            shutil.copy2(
-                f"{source}/Histories/{exp}.csv", f"{destin}/Histories/{exp}.csv"
-            )
-            shutil.copytree(f"{source}/Weights/{exp}", f"{destin}/Weights/{exp}")
-            shutil.copytree(f"{source}/Gradients/{exp}", f"{destin}/Gradients/{exp}")
-
-        if "name" in df.columns:
-            df_to_transfer = df[df["name"].isin(ppls)]
-        else:
-            df_to_transfer = df[df["pplid"].isin(ppls)]
-        df_to_transfer.to_csv(f"{destin}/ppls.csv", mode="a", header=False, index=False)
-        print(f"{ppls} are transferred successfully")
-
-    elif mode == "move":
-        for exp in ppls:
-            shutil.move(f"{source}/Weights/{exp}", f"{destin}/Weights/")
-            shutil.move(f"{source}/Configs/{exp}.json", f"{destin}/Configs/{exp}.json")
-            shutil.move(
-                f"{source}/Histories/{exp}.csv", f"{destin}/Histories/{exp}.csv"
-            )
-            shutil.move(f"{source}/Gradients/{exp}", f"{destin}/Gradients/")
-
-        if "name" in df.columns:
-            df_to_move = df[df["name"].isin(ppls)]
-            df_remaining = df[~df["name"].isin(ppls)]
-        else:
-            df_to_move = df[df["pplid"].isin(ppls)]
-            df_remaining = df[~df["pplid"].isin(ppls)]
-
-        df_remaining.to_csv(f"{source}/ppls.csv", index=False)
-        df_to_move.to_csv(f"{destin}/ppls.csv", mode="a", header=False, index=False)
-
-        print(f"{ppls} are transferred successfully")
-
-    else:
+    if mode not in {"copy", "move"}:
         raise ValueError(f"Invalid mode: {mode}. Expected 'copy' or 'move'.")
+
+    os.makedirs(destin, exist_ok=True)
+    for folder in ["Configs", "Histories", "Weights", "Gradients"]:
+        os.makedirs(os.path.join(destin, folder), exist_ok=True)
+
+    source_records = _collect_source_records(source)
+    transfer_ppls = _resolve_transfer_set(ppls, source)
+
+    if not transfer_ppls:
+        print("No pipelines resolved for transfer")
+        return
+
+    for pplid in transfer_ppls:
+        for spec in _pipeline_artifact_specs(pplid):
+            src = os.path.join(source, spec["src"])
+            dst = os.path.join(destin, spec["dst"])
+            if not os.path.exists(src):
+                continue
+
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if spec["kind"] == "file":
+                if mode == "copy":
+                    shutil.copy2(src, dst)
+                else:
+                    shutil.move(src, dst)
+            else:
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                if mode == "copy":
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.move(src, dst)
+
+    source_db = os.path.join(source, "ppls.db")
+    destin_db = os.path.join(destin, "ppls.db")
+
+    if os.path.exists(source_db):
+        src_db = Db(db_path=source_db)
+        dst_db = Db(db_path=destin_db)
+        try:
+            for pplid in transfer_ppls:
+                row = src_db.query(
+                    "SELECT pplid, args_hash FROM ppls WHERE pplid = ?", (pplid,)
+                )
+                if row:
+                    dst_db.execute(
+                        "INSERT OR REPLACE INTO ppls (pplid, args_hash) VALUES (?, ?)",
+                        row[0],
+                    )
+
+            edge_rows = src_db.query("SELECT prev, next, desc, directed FROM edges")
+            for prev, nxt, desc, directed in edge_rows:
+                if prev in transfer_ppls and nxt in transfer_ppls:
+                    dst_db.execute(
+                        "INSERT OR REPLACE INTO edges (prev, next, desc, directed) VALUES (?, ?, ?, ?)",
+                        (prev, nxt, desc, directed),
+                    )
+
+            if mode == "move":
+                for pplid in transfer_ppls:
+                    src_db.execute("DELETE FROM ppls WHERE pplid = ?", (pplid,))
+                src_db.execute(
+                    "DELETE FROM edges WHERE prev IN ({}) OR next IN ({})".format(
+                        ",".join(["?"] * len(transfer_ppls)),
+                        ",".join(["?"] * len(transfer_ppls)),
+                    ),
+                    tuple(transfer_ppls + transfer_ppls),
+                )
+        finally:
+            src_db.close()
+            dst_db.close()
+
+    _write_transfer_manifest(
+        destination=destin,
+        transfer_type=transfer_type,
+        mode=mode,
+        requested=ppls,
+        transferred=transfer_ppls,
+        source_records=source_records,
+    )
+
+    included = [p for p in transfer_ppls if p not in ppls]
+    if included:
+        print(
+            f"Transferred {transfer_ppls}. Auto-included dependent pipelines: {included}"
+        )
+    else:
+        print(f"Transferred {transfer_ppls}")
 
 
 def group_by_common_columns(
